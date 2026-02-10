@@ -12,8 +12,8 @@ class TEFIPIntegration:
         self.root.geometry("800x600")
         
         # Diretórios
-        self.req_dir = r"C:\TEF_DIAL\REQ"
-        self.resp_dir = r"C:\TEF_DIAL\RESP"
+        self.req_dir = r"C:\\Auttar_TefIP\REQ"
+        self.resp_dir = r"C:\\Auttar_TefIP\RESP"
         
         # Variáveis
         self.running = False
