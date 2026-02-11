@@ -1,296 +1,284 @@
 import os
-import threading
 import time
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 from datetime import datetime
 
-class TEFIPIntegration:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Integração TEF-IP Auttar")
-        self.root.geometry("800x600")
-        
-        # Diretórios
-        self.req_dir = r"C:\\Auttar_TefIP\REQ"
-        self.resp_dir = r"C:\\Auttar_TefIP\RESP"
-        
-        # Variáveis
-        self.running = False
-        self.last_id = 0
-        
-        # Criar interface
-        self.create_widgets()
-        
-        # Verificar diretórios
-        self.verify_directories()
-        
-        # Iniciar monitoramento
-        self.start_monitoring()
+class TefFileHandler:
+    """Manipula a criação de arquivos seguindo o padrão estrito da Auttar."""
     
-    def create_widgets(self):
-        # Frame principal
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Frame de operações
-        op_frame = ttk.LabelFrame(main_frame, text="Operações", padding="10")
-        op_frame.pack(fill=tk.X, pady=5)
-        
-        # Botões de operações
-        ttk.Button(op_frame, text="Crédito à Vista", command=self.credito_vista).grid(row=0, column=0, padx=5, pady=5)
-        ttk.Button(op_frame, text="Débito", command=self.debito).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Button(op_frame, text="Crédito Parcelado", command=self.credito_parcelado).grid(row=0, column=2, padx=5, pady=5)
-        ttk.Button(op_frame, text="Cancelar", command=self.cancelar).grid(row=1, column=0, padx=5, pady=5)
-        ttk.Button(op_frame, text="PIX QRCODE", command=self.pix_qrcode).grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(op_frame, text="Administrativa", command=self.administrativa).grid(row=1, column=2, padx=5, pady=5)
-        
-        # Frame de dados
-        data_frame = ttk.LabelFrame(main_frame, text="Dados", padding="10")
-        data_frame.pack(fill=tk.X, pady=5)
-        
-        # Campos
-        ttk.Label(data_frame, text="Valor:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
-        self.valor_entry = ttk.Entry(data_frame)
-        self.valor_entry.grid(row=0, column=1, padx=5, pady=2)
-        
-        ttk.Label(data_frame, text="Doc. Fiscal:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
-        self.doc_fiscal_entry = ttk.Entry(data_frame)
-        self.doc_fiscal_entry.grid(row=1, column=1, padx=5, pady=2)
-        
-        ttk.Label(data_frame, text="NSU:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=2)
-        self.nsu_entry = ttk.Entry(data_frame)
-        self.nsu_entry.grid(row=2, column=1, padx=5, pady=2)
-        
-        # Frame de parcelamento
-        parcel_frame = ttk.LabelFrame(main_frame, text="Parcelamento", padding="10")
-        parcel_frame.pack(fill=tk.X, pady=5)
-        
-        ttk.Label(parcel_frame, text="Tipo:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=2)
-        self.tipo_parcelamento_var = tk.StringVar(value="0")
-        ttk.Radiobutton(parcel_frame, text="Estabelecimento", variable=self.tipo_parcelamento_var, value="0").grid(row=0, column=1, padx=5, pady=2)
-        ttk.Radiobutton(parcel_frame, text="Administradora", variable=self.tipo_parcelamento_var, value="1").grid(row=0, column=2, padx=5, pady=2)
-        
-        ttk.Label(parcel_frame, text="Parcelas:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=2)
-        self.parcelas_entry = ttk.Entry(parcel_frame, width=10)
-        self.parcelas_entry.grid(row=1, column=1, padx=5, pady=2)
-        
-        # Frame de logs
-        log_frame = ttk.LabelFrame(main_frame, text="Logs", padding="10")
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=15)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        
-        # Barra de status
-        self.status_var = tk.StringVar()
-        self.status_var.set("Pronto")
-        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.pack(fill=tk.X, pady=5)
-    
-    def verify_directories(self):
-        """Verifica e cria os diretórios necessários"""
-        try:
-            os.makedirs(self.req_dir, exist_ok=True)
-            os.makedirs(self.resp_dir, exist_ok=True)
-            self.log("Diretórios verificados")
-        except Exception as e:
-            self.log(f"ERRO: {str(e)}")
-    
-    def log(self, message):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.log_text.see(tk.END)
-    
-    def create_request_file(self, operation, fields=None):
-        """Cria arquivo de requisição"""
-        try:
-            # Criar arquivo temporário
-            tmp_file = os.path.join(self.req_dir, "IntPos.tmp")
+    @staticmethod
+    def ler_arquivo(filepath):
+        """Lê o arquivo de resposta tratando a codificação correta (ANSI/CP1252)."""
+        dados = {}
+        if not os.path.exists(filepath):
+            return None
             
-            with open(tmp_file, 'w') as f:
-                f.write(f"000-000 = {operation}\n")
-                f.write(f"001-000 = {self.generate_id()}\n")
+        try:
+            # 'mbcs' é o encoding padrão para arquivos de texto legados no Windows (ANSI)
+            with open(filepath, 'r', encoding='mbcs') as f:
+                for linha in f:
+                    linha = linha.strip()
+                    if '=' in linha:
+                        chave, valor = linha.split('=', 1)
+                        dados[chave.strip()] = valor.strip()
+        except Exception as e:
+            print(f"Erro ao ler arquivo: {e}")
+        return dados
+
+    @staticmethod
+    def escrever_arquivo(diretorio, dados_dict):
+        """
+        CRÍTICO: Escreve em .tmp e renomeia para .001.
+        Isso garante que o TEF só leia o arquivo quando ele estiver completo.
+        """
+        caminho_tmp = os.path.join(diretorio, "IntPos.tmp")
+        caminho_final = os.path.join(diretorio, "IntPos.001")
+
+        try:
+            # Força encoding ANSI para compatibilidade total
+            with open(caminho_tmp, 'w', encoding='mbcs') as f:
+                # O Header 000-000 DEVE ser a primeira linha
+                if "000-000" in dados_dict:
+                    f.write(f"000-000 = {dados_dict['000-000']}\n")
+                    del dados_dict["000-000"]
                 
-                if fields:
-                    for field, value in fields.items():
-                        f.write(f"{field} = {value}\n")
+                # Escreve os demais campos
+                for k, v in dados_dict.items():
+                    if v is not None:
+                        f.write(f"{k} = {v}\n")
                 
+                # Trailer obrigatório
                 f.write("999-999 = 0\n")
             
-            # Renomear para arquivo final
-            final_file = os.path.join(self.req_dir, "IntPos.001")
-            os.rename(tmp_file, final_file)
-            
-            self.log(f"Arquivo criado: {operation}")
+            # Remove o arquivo de destino se já existir (limpeza)
+            if os.path.exists(caminho_final):
+                os.remove(caminho_final)
+                
+            # Renomeia (Operação Atômica)
+            os.rename(caminho_tmp, caminho_final)
             return True
         except Exception as e:
-            self.log(f"ERRO: {str(e)}")
+            print(f"Erro ao escrever arquivo: {e}")
             return False
-    
-    def generate_id(self):
-        self.last_id += 1
-        return str(self.last_id).zfill(10)
-    
-    def credito_vista(self):
-        """Crédito à Vista"""
-        valor = self.valor_entry.get()
-        doc_fiscal = self.doc_fiscal_entry.get()
+
+    @staticmethod
+    def limpar_diretorio(diretorio):
+        """Remove arquivos .001, .Sts e .tmp antigos."""
+        for item in os.listdir(diretorio):
+            if item.endswith(".001") or item.endswith(".Sts") or item.endswith(".tmp"):
+                try:
+                    os.remove(os.path.join(diretorio, item))
+                except:
+                    pass
+
+class TefApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Integração TEF-IP Auttar | Profissional")
+        self.root.geometry("900x650")
+        self.root.configure(bg="#2d2d2d")
+
+        # --- CONFIGURAÇÃO DE DIRETÓRIOS ---
+        self.dir_base = r"C:\Auttar_TefIP"
+        self.dir_req = os.path.join(self.dir_base, "REQ")
+        self.dir_resp = os.path.join(self.dir_base, "RESP")
         
-        if not valor or not doc_fiscal:
-            messagebox.showerror("Erro", "Preencha Valor e Documento Fiscal")
-            return
+        # Variáveis de Controle
+        self.seq_id = 1
+        self.processando = False
+
+        self.setup_ui()
+        self.check_dirs()
+
+    def setup_ui(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("TFrame", background="#2d2d2d")
+        style.configure("TLabel", background="#2d2d2d", foreground="white", font=("Segoe UI", 10))
+        style.configure("TButton", font=("Segoe UI", 10, "bold"), background="#007acc", foreground="white")
         
-        valor = valor.replace(",", "").replace(".", "")
+        # Header
+        header = ttk.Frame(self.root, padding=10)
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="MOURATEC TEF", font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT)
+        self.lbl_status = ttk.Label(header, text="● AGUARDANDO", foreground="#00ff00")
+        self.lbl_status.pack(side=tk.RIGHT)
+
+        # Container Principal
+        container = ttk.Frame(self.root, padding=10)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        # Painel Esquerdo
+        painel_inputs = ttk.Frame(container)
+        painel_inputs.pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        self.add_input(painel_inputs, "Valor (R$):", "txt_valor", "10,00")
+        self.add_input(painel_inputs, "Doc Fiscal:", "txt_doc", datetime.now().strftime("%H%M%S"))
+
+        ttk.Button(painel_inputs, text="CRÉDITO", command=lambda: self.iniciar("CREDITO")).pack(fill=tk.X, pady=5)
+        ttk.Button(painel_inputs, text="DÉBITO", command=lambda: self.iniciar("DEBITO")).pack(fill=tk.X, pady=5)
+        ttk.Button(painel_inputs, text="CANCELAR ÚLTIMA (NCN)", command=self.forcar_cancelamento).pack(fill=tk.X, pady=20)
+
+        # Painel Direito (Log)
+        painel_log = ttk.Frame(container)
+        painel_log.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
         
-        fields = {
-            "002-000": doc_fiscal,
-            "003-000": valor,
-            "011-000": "10"
-        }
-        
-        self.log(f"Crédito à Vista: R$ {valor}")
-        self.create_request_file("CRT", fields)
-        self.status_var.set("Aguardando resposta...")
-    
-    def debito(self):
-        """Débito"""
-        valor = self.valor_entry.get()
-        doc_fiscal = self.doc_fiscal_entry.get()
-        
-        if not valor or not doc_fiscal:
-            messagebox.showerror("Erro", "Preencha Valor e Documento Fiscal")
-            return
-        
-        valor = valor.replace(",", "").replace(".", "")
-        
-        fields = {
-            "002-000": doc_fiscal,
-            "003-000": valor,
-            "011-000": "20"
-        }
-        
-        self.log(f"Débito: R$ {valor}")
-        self.create_request_file("CRT", fields)
-        self.status_var.set("Aguardando resposta...")
-    
-    def credito_parcelado(self):
-        """Crédito Parcelado"""
-        valor = self.valor_entry.get()
-        doc_fiscal = self.doc_fiscal_entry.get()
-        parcelas = self.parcelas_entry.get()
-        tipo = self.tipo_parcelamento_var.get()
-        
-        if not valor or not doc_fiscal or not parcelas:
-            messagebox.showerror("Erro", "Preencha todos os campos")
-            return
-        
-        valor = valor.replace(",", "").replace(".", "")
-        tipo_transacao = "11" if tipo == "0" else "12"
-        
-        fields = {
-            "002-000": doc_fiscal,
-            "003-000": valor,
-            "011-000": tipo_transacao,
-            "017-000": tipo,
-            "018-000": parcelas
-        }
-        
-        self.log(f"Crédito Parcelado: R$ {valor} em {parcelas}x")
-        self.create_request_file("CRT", fields)
-        self.status_var.set("Aguardando resposta...")
-    
-    def cancelar(self):
-        """Cancelamento"""
-        nsu = self.nsu_entry.get()
-        doc_fiscal = self.doc_fiscal_entry.get()
-        
-        if not nsu or not doc_fiscal:
-            messagebox.showerror("Erro", "Preencha NSU e Documento Fiscal")
-            return
-        
-        fields = {
-            "002-000": doc_fiscal,
-            "012-000": nsu
-        }
-        
-        self.log(f"Cancelamento: NSU {nsu}")
-        self.create_request_file("CNC", fields)
-        self.status_var.set("Aguardando resposta...")
-    
-    def pix_qrcode(self):
-        """PIX QRCODE"""
-        valor = self.valor_entry.get()
-        doc_fiscal = self.doc_fiscal_entry.get()
-        
-        if not valor or not doc_fiscal:
-            messagebox.showerror("Erro", "Preencha Valor e Documento Fiscal")
-            return
-        
-        valor = valor.replace(",", "").replace(".", "")
-        
-        fields = {
-            "002-000": doc_fiscal,
-            "003-000": valor
-        }
-        
-        self.log(f"PIX QRCODE: R$ {valor}")
-        self.create_request_file("QRC", fields)
-        self.status_var.set("Aguardando resposta...")
-    
-    def administrativa(self):
-        """Operação Administrativa - executa diretamente"""
-        # Executa diretamente a operação de cancelamento administrativo
-        fields = {}
-        
-        # Se houver NSU preenchido, usa-o
-        nsu = self.nsu_entry.get()
-        if nsu:
-            fields["012-000"] = nsu
-        
-        self.log("ADM: CANCELAMENTO")
-        self.create_request_file("ADM", fields)
-        self.status_var.set("Executando CANCELAMENTO...")
-    
-    def start_monitoring(self):
-        self.running = True
-        monitor_thread = threading.Thread(target=self.monitor_directories)
-        monitor_thread.daemon = True
-        monitor_thread.start()
-    
-    def monitor_directories(self):
-        while self.running:
-            try:
-                # Verificar arquivo de status
-                sts_file = os.path.join(self.resp_dir, "IntPos.Sts")
-                if os.path.exists(sts_file):
-                    with open(sts_file, 'r') as f:
-                        content = f.read()
-                        self.log(f"Status: {content.strip()}")
-                    os.remove(sts_file)
-                    self.status_var.set("CTFClient processando...")
-                
-                # Verificar arquivo de resposta
-                resp_file = os.path.join(self.resp_dir, "IntPos.001")
-                if os.path.exists(resp_file):
-                    with open(resp_file, 'r') as f:
-                        for line in f:
-                            line = line.strip()
-                            if line.startswith("009-000 ="):
-                                status = line.split("=")[1].strip()
-                                self.status_var.set("APROVADO" if status == "0" else f"NEGADO ({status})")
-                            elif line.startswith("012-000 ="):
-                                nsu = line.split("=")[1].strip()
-                                self.nsu_entry.delete(0, tk.END)
-                                self.nsu_entry.insert(0, nsu)
-                    
-                    os.remove(resp_file)
-                
+        ttk.Label(painel_log, text="Log de Execução:").pack(anchor="w")
+        self.txt_log = scrolledtext.ScrolledText(painel_log, bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 9))
+        self.txt_log.pack(fill=tk.BOTH, expand=True)
+        self.txt_log.tag_config("INFO", foreground="#569cd6")
+        self.txt_log.tag_config("SUCCESS", foreground="#4ec9b0")
+        self.txt_log.tag_config("ERROR", foreground="#f44747")
+
+    def add_input(self, parent, label, var_name, default):
+        ttk.Label(parent, text=label).pack(anchor="w")
+        entry = ttk.Entry(parent)
+        entry.insert(0, default)
+        entry.pack(fill=tk.X, pady=(0, 10))
+        setattr(self, var_name, entry)
+
+    def log(self, msg, tipo="INFO"):
+        hora = datetime.now().strftime("%H:%M:%S")
+        self.txt_log.insert(tk.END, f"[{hora}] {msg}\n", tipo)
+        self.txt_log.see(tk.END)
+
+    def check_dirs(self):
+        try:
+            os.makedirs(self.dir_req, exist_ok=True)
+            os.makedirs(self.dir_resp, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("Erro", f"Não foi possível criar pastas: {e}")
+
+    def iniciar(self, operacao):
+        if self.processando: return
+        threading.Thread(target=self.fluxo_transacao, args=(operacao,)).start()
+
+    def fluxo_transacao(self, operacao):
+        self.processando = True
+        self.lbl_status.config(text="● PROCESSANDO...", foreground="yellow")
+        self.log(f"--- Iniciando {operacao} ---")
+
+        # 1. Limpeza
+        TefFileHandler.limpar_diretorio(self.dir_resp)
+        TefFileHandler.limpar_diretorio(self.dir_req)
+
+        valor = self.txt_valor.get().replace(",", "").replace(".", "")
+        doc = self.txt_doc.get()
+        id_transacao = str(self.seq_id).zfill(10)
+        self.seq_id += 1
+
+        try:
+            # 2. Requisição (CRT)
+            req = {
+                "000-000": "CRT",
+                "001-000": id_transacao,
+                "002-000": doc,
+                "003-000": valor,
+                "011-000": "10" if operacao == "CREDITO" else "20",
+                "999-999": "0"
+            }
+            
+            self.log("Enviando solicitação (CRT)...")
+            if not TefFileHandler.escrever_arquivo(self.dir_req, req):
+                raise Exception("Falha na escrita do arquivo")
+
+            # 3. Aguarda recebimento (IntPos.Sts)
+            self.log("Aguardando CTFClient (Sts)...")
+            inicio = time.time()
+            sts_ok = False
+            while time.time() - inicio < 10:
+                if os.path.exists(os.path.join(self.dir_resp, "IntPos.Sts")):
+                    try:
+                        os.remove(os.path.join(self.dir_resp, "IntPos.Sts"))
+                        sts_ok = True
+                        break
+                    except: pass
                 time.sleep(0.5)
-            except Exception as e:
-                self.log(f"ERRO: {str(e)}")
+            
+            if not sts_ok:
+                raise Exception("Timeout: CTFClient não respondeu (Verifique se está rodando).")
+
+            # 4. Aguarda Resposta Final (IntPos.001)
+            self.log("Aguardando senha no Pinpad...")
+            resp_dados = None
+            caminho_resp = os.path.join(self.dir_resp, "IntPos.001")
+            
+            while self.processando:
+                if os.path.exists(caminho_resp):
+                    time.sleep(0.5) # Garante fim da escrita pelo Java
+                    resp_dados = TefFileHandler.ler_arquivo(caminho_resp)
+                    try: os.remove(caminho_resp)
+                    except: pass
+                    break
+                time.sleep(1)
+
+            if not resp_dados: return
+
+            status = resp_dados.get("009-000", "99")
+            msg = resp_dados.get("030-000", "")
+            
+            if status == "0": # APROVADA
+                self.log(f"APROVADA: {msg}", "SUCCESS")
+                
+                # --- PONTO CRÍTICO: CONFIRMAÇÃO ---
+                # É necessário pegar os dados exatos que o servidor retornou
+                # para confirmar a transação correta.
+                
+                rede_adquirente = resp_dados.get("010-000") # Ex: GETNET, REDECARD
+                nsu_host = resp_dados.get("012-000")        # Ex: 000000006
+                
+                if not rede_adquirente or not nsu_host:
+                    self.log("ALERTA: Rede ou NSU não retornados. Tentando confirmar mesmo assim...", "ERROR")
+
+                # Simula tempo de impressão e processamento do CTFClient (Evita erro de arquivo travado)
+                self.log("Estabilizando (2s)...")
+                time.sleep(2)
+
+                confirmar = messagebox.askyesno("Impressão", "O comprovante foi impresso corretamente?")
+                
+                cnf_req = {
+                    "000-000": "CNF" if confirmar else "NCN",
+                    "001-000": id_transacao,
+                    "002-000": doc,
+                    "010-000": rede_adquirente, # OBRIGATÓRIO PARA SUCESSO
+                    "012-000": nsu_host,        # OBRIGATÓRIO PARA SUCESSO
+                    "027-000": datetime.now().strftime("%d%m%y%H%M%S"), # Data/Hora
+                    "999-999": "0"
+                }
+                
+                self.log(f"Enviando {cnf_req['000-000']}...")
+                TefFileHandler.escrever_arquivo(self.dir_req, cnf_req)
+                
+                self.log("Fluxo finalizado.", "SUCCESS")
+                messagebox.showinfo("Fim", f"Transação {'CONFIRMADA' if confirmar else 'DESFEITA'}")
+
+            else:
+                self.log(f"NEGADA ({status}): {msg}", "ERROR")
+                messagebox.showerror("Negada", msg)
+
+        except Exception as e:
+            self.log(f"ERRO: {e}", "ERROR")
+        
+        finally:
+            self.processando = False
+            self.lbl_status.config(text="● PRONTO", foreground="#00ff00")
+
+    def forcar_cancelamento(self):
+        """Função de emergência para destravar transações pendentes."""
+        # Cria um NCN genérico para tentar limpar a fila
+        req = {
+            "000-000": "NCN",
+            "001-000": str(self.seq_id).zfill(10),
+            "002-000": self.txt_doc.get(),
+            "010-000": "PENDENTE", # Tenta forçar
+            "999-999": "0"
+        }
+        TefFileHandler.escrever_arquivo(self.dir_req, req)
+        self.log("Enviado NCN de emergência.", "INFO")
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = TEFIPIntegration(root)
+    app = TefApp(root)
     root.mainloop()
