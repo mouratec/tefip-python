@@ -6,72 +6,75 @@ from tkinter import ttk, messagebox, simpledialog
 from datetime import datetime
 
 # =============================================================================
-# CONFIGURAÇÕES E UTILITÁRIOS
+# CONFIGURAÇÕES
 # =============================================================================
 class TefConfig:
-    # Diretórios conforme Manual pág 11 
     DIR_BASE = r"C:\Auttar_TefIP"
     DIR_REQ = os.path.join(DIR_BASE, "REQ")
     DIR_RESP = os.path.join(DIR_BASE, "RESP")
     FILE_SEQ = "tef_sequence.dat"
 
 class SequenceManager:
-    """Gerencia o ID único da transação (Campo 001-000) [cite: 250]"""
+    """
+    Gerencia o ID sequencial com Thread Lock para evitar números repetidos
+    no log em operações rápidas.
+    """
+    _lock = threading.Lock()
+
+    @staticmethod
+    def reset_sequence():
+        """Reseta para 0 apenas ao abrir o sistema"""
+        with SequenceManager._lock:
+            try:
+                with open(TefConfig.FILE_SEQ, "w") as f:
+                    f.write("0")
+            except: pass
+
     @staticmethod
     def get_next_id():
-        current_id = 1
-        if os.path.exists(TefConfig.FILE_SEQ):
-            try:
-                with open(TefConfig.FILE_SEQ, "r") as f:
-                    content = f.read().strip()
-                    if content.isdigit():
-                        current_id = int(content)
-            except: pass
-        
-        next_id = current_id + 1
-        try:
-            with open(TefConfig.FILE_SEQ, "w") as f:
-                f.write(str(next_id))
-        except: pass
+        """Lê, incrementa e salva de forma atômica (Thread-Safe)"""
+        with SequenceManager._lock:
+            current_id = 0
+            if os.path.exists(TefConfig.FILE_SEQ):
+                try:
+                    with open(TefConfig.FILE_SEQ, "r") as f:
+                        content = f.read().strip()
+                        if content.isdigit():
+                            current_id = int(content)
+                except: pass
             
-        return str(current_id).zfill(10)
+            next_id = current_id + 1
+            try:
+                with open(TefConfig.FILE_SEQ, "w") as f:
+                    f.write(str(next_id))
+            except: pass
+            
+            return str(next_id).zfill(10)
 
 class TefFileHandler:
-    """Manipulação de arquivos REQ/RESP conforme protocolo Auttar"""
-    
     @staticmethod
     def setup_directories():
         os.makedirs(TefConfig.DIR_REQ, exist_ok=True)
         os.makedirs(TefConfig.DIR_RESP, exist_ok=True)
-        # Limpeza preventiva
-        for f in os.listdir(TefConfig.DIR_REQ):
-            try: os.remove(os.path.join(TefConfig.DIR_REQ, f))
-            except: pass
-        for f in os.listdir(TefConfig.DIR_RESP):
-            try: os.remove(os.path.join(TefConfig.DIR_RESP, f))
-            except: pass
+        for p in [TefConfig.DIR_REQ, TefConfig.DIR_RESP]:
+            for f in os.listdir(p):
+                try: os.remove(os.path.join(p, f))
+                except: pass
 
     @staticmethod
     def write_request(data_dict):
-        """Escreve IntPos.tmp e renomeia para IntPos.001 [cite: 202]"""
         tmp_path = os.path.join(TefConfig.DIR_REQ, "IntPos.tmp")
         final_path = os.path.join(TefConfig.DIR_REQ, "IntPos.001")
-        
         try:
             with open(tmp_path, 'w', encoding='mbcs') as f:
-                # Header primeiro
                 if "000-000" in data_dict:
                     f.write(f"000-000 = {data_dict['000-000']}\n")
-                
                 for k, v in data_dict.items():
                     if k not in ["000-000", "999-999"] and v is not None:
                         f.write(f"{k} = {v}\n")
-                
-                # Trailer [cite: 441]
                 f.write("999-999 = 0\n")
             
-            if os.path.exists(final_path):
-                os.remove(final_path)
+            if os.path.exists(final_path): os.remove(final_path)
             os.rename(tmp_path, final_path)
             return True
         except Exception as e:
@@ -80,33 +83,24 @@ class TefFileHandler:
 
     @staticmethod
     def wait_response(timeout=60):
-        """
-        Aguarda IntPos.Sts (confirmação de recebimento) e depois IntPos.001 (resposta)
-        Fluxo descrito na página 5[cite: 47, 48].
-        """
-        # 1. Aguarda STS (Max 7s) [cite: 47]
         start = time.time()
-        sts_ok = False
         sts_path = os.path.join(TefConfig.DIR_RESP, "IntPos.Sts")
-        
+        # Aguarda STS
         while time.time() - start < 7:
             if os.path.exists(sts_path):
                 try: os.remove(sts_path)
                 except: pass
-                sts_ok = True
                 break
             time.sleep(0.1)
-            
-        if not sts_ok:
+        else:
             return None, "Erro: CTFClient não respondeu (Sem STS)."
 
-        # 2. Aguarda Resposta
+        # Aguarda Resposta
         resp_path = os.path.join(TefConfig.DIR_RESP, "IntPos.001")
         start = time.time()
         while time.time() - start < timeout:
             if os.path.exists(resp_path):
-                # Pequeno delay para garantir escrita completa
-                time.sleep(0.2)
+                time.sleep(0.3)
                 data = {}
                 try:
                     with open(resp_path, 'r', encoding='mbcs') as f:
@@ -116,348 +110,469 @@ class TefFileHandler:
                                 data[k.strip()] = v.strip()
                     os.remove(resp_path)
                     return data, "Sucesso"
-                except Exception as e:
-                    return None, f"Erro leitura: {e}"
+                except: pass
             time.sleep(0.5)
-            
-        return None, "Timeout aguardando resposta do TEF."
+        return None, "Timeout aguardando resposta TEF."
 
 # =============================================================================
-# INTERFACE GRÁFICA E LÓGICA DE NEGÓCIO
+# JANELAS DE INPUT
 # =============================================================================
-class MainApp:
+class InputDialog(tk.Toplevel):
+    def __init__(self, parent, title, fields):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry("350x350")
+        self.result = None
+        self.entries = {}
+        
+        container = tk.Frame(self, padx=20, pady=20)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        for label_text, key in fields:
+            tk.Label(container, text=label_text, font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(5, 0))
+            entry = ttk.Entry(container)
+            entry.pack(fill=tk.X)
+            self.entries[key] = entry
+
+        tk.Button(container, text="Confirmar", bg="#27ae60", fg="white", command=self.on_ok).pack(fill=tk.X, pady=20)
+
+    def on_ok(self):
+        data = {}
+        for key, entry in self.entries.items():
+            val = entry.get().strip()
+            # Permite campos opcionais em cenários específicos
+            if not val and key not in ['rede']: 
+                messagebox.showwarning("Aviso", "Preencha todos os campos obrigatórios")
+                return
+            data[key] = val
+        self.result = data
+        self.destroy()
+
+# =============================================================================
+# PDV PRINCIPAL
+# =============================================================================
+class ModernPDV:
     def __init__(self, root):
         self.root = root
-        self.root.title("PDV TEF Auttar - Fluxo Controlado")
-        self.root.geometry("1000x600")
-        self.root.configure(bg="#f0f2f5")
+        self.root.title("PDV TEF Auttar - Parcelado & Sequencial")
+        self.root.geometry("1150x780") # Aumentei um pouco a altura
+        self.root.configure(bg="#f4f6f9")
         
         TefFileHandler.setup_directories()
+        SequenceManager.reset_sequence()
         
-        # Estado da Venda
-        self.valor_total_venda = 0.0
+        # Estrutura: {id_req, nsu, rede, finalizacao, valor, tipo, data_operacao, hora_operacao, status}
+        self.historico_transacoes = [] 
+        
         self.valor_restante = 0.0
-        self.transacoes_pendentes = [] # Lista de transações aprovadas mas não confirmadas
-        self.lock = False # Mutex simples para UI
-        self.doc_fiscal = "1001" # Exemplo
+        self.lock = False 
+        self.doc_fiscal = "1001"
 
-        self.setup_ui()
+        self.setup_layout()
 
-    def setup_ui(self):
-        # --- Estilos ---
+    def setup_layout(self):
         style = ttk.Style()
         style.theme_use('clam')
-        style.configure("Treeview", rowheight=25, font=('Arial', 10))
-        style.configure("Header.TLabel", font=('Segoe UI', 12, 'bold'), background="#f0f2f5")
+        style.configure("Card.TFrame", background="white", relief="raised")
+        style.configure("Treeview", font=('Segoe UI', 10), rowheight=28)
         
-        # --- Layout Principal ---
-        left_panel = tk.Frame(self.root, bg="white", padx=15, pady=15, relief=tk.RAISED, bd=1)
-        left_panel.pack(side=tk.LEFT, fill=tk.Y)
+        container = tk.Frame(self.root, bg="#f4f6f9")
+        container.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+
+        # === ESQUERDA (OPERAÇÕES) ===
+        left_panel = ttk.Frame(container, style="Card.TFrame", padding=15)
+        left_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+
+        tk.Label(left_panel, text="Operação de Venda", font=("Segoe UI", 14, "bold"), bg="white").pack(anchor="w", pady=(0, 15))
+
+        tk.Label(left_panel, text="VALOR TOTAL (R$)", bg="white", fg="#7f8c8d").pack(anchor="w")
+        self.entry_total = ttk.Entry(left_panel, font=("Segoe UI", 16))
+        self.entry_total.insert(0, "100.00")
+        self.entry_total.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(left_panel, text="PAGAMENTO ATUAL (R$)", bg="white", fg="#27ae60").pack(anchor="w")
+        self.entry_pagamento = ttk.Entry(left_panel, font=("Segoe UI", 16))
+        self.entry_pagamento.insert(0, "100.00")
+        self.entry_pagamento.pack(fill=tk.X, pady=(0, 20))
+
+        btn_cfg = {'font': ("Segoe UI", 10, "bold"), 'bg': "#3498db", 'fg': "white", 'relief': "flat", 'bd': 0, 'cursor': "hand2"}
         
-        right_panel = tk.Frame(self.root, bg="#f0f2f5", padx=15, pady=15)
+        # Botões de Crédito
+        tk.Button(left_panel, text="CRÉDITO À VISTA", command=lambda: self.iniciar_tef("CREDITO"), **btn_cfg).pack(fill=tk.X, pady=4, ipady=5)
+        
+        # NOVO BOTÃO: CRÉDITO PARCELADO
+        btn_parc = btn_cfg.copy()
+        btn_parc['bg'] = "#2980b9" # Azul um pouco mais escuro
+        tk.Button(left_panel, text="CRÉDITO PARCELADO (S/ JUROS)", command=lambda: self.iniciar_tef("CREDITO_PARCELADO"), **btn_parc).pack(fill=tk.X, pady=4, ipady=5)
+
+        tk.Button(left_panel, text="DÉBITO", command=lambda: self.iniciar_tef("DEBITO"), **btn_cfg).pack(fill=tk.X, pady=4, ipady=5)
+        
+        btn_pix_style = btn_cfg.copy()
+        btn_pix_style['bg'] = "#27ae60"
+        tk.Button(left_panel, text="PIX (PAGAMENTO)", command=lambda: self.iniciar_tef("PIX_PAGAMENTO"), **btn_pix_style).pack(fill=tk.X, pady=4, ipady=5)
+
+        tk.Frame(left_panel, height=2, bg="#ecf0f1").pack(fill=tk.X, pady=20)
+        
+        tk.Label(left_panel, text="Administrativo / Cancelamento", font=("Segoe UI", 12, "bold"), bg="white", fg="#e67e22").pack(anchor="w", pady=(0, 10))
+        
+        btn_adm = btn_cfg.copy()
+        btn_adm['bg'] = "#95a5a6"
+        tk.Button(left_panel, text="MENU ADMINISTRATIVO", command=lambda: self.iniciar_tef("ADM_GENERICO"), **btn_adm).pack(fill=tk.X, pady=4, ipady=5)
+        
+        btn_danger = btn_cfg.copy()
+        btn_danger['bg'] = "#e74c3c"
+        tk.Button(left_panel, text="CANCELAR ITEM SELECIONADO / MANUAL", command=self.cancelar_inteligente, **btn_danger).pack(fill=tk.X, pady=4, ipady=5)
+
+        self.lbl_status = tk.Label(left_panel, text="Caixa Livre", bg="white", fg="gray", font=("Segoe UI", 9))
+        self.lbl_status.pack(side=tk.BOTTOM, pady=10)
+
+        # === DIREITA (HISTÓRICO) ===
+        right_panel = ttk.Frame(container, style="Card.TFrame", padding=15)
         right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
-        # === PAINEL ESQUERDO (Ações de Venda) ===
-        tk.Label(left_panel, text="PDV - CAIXA LIVRE", font=("Segoe UI", 16, "bold"), bg="white", fg="#2c3e50").pack(pady=(0, 20))
-        
-        tk.Label(left_panel, text="Valor Total da Venda (R$):", bg="white", font=("Segoe UI", 10)).pack(anchor="w")
-        self.entry_valor = ttk.Entry(left_panel, font=("Segoe UI", 14))
-        self.entry_valor.insert(0, "100.00")
-        self.entry_valor.pack(fill=tk.X, pady=(0, 10))
-        
-        tk.Label(left_panel, text="Doc. Fiscal:", bg="white").pack(anchor="w")
-        self.entry_doc = ttk.Entry(left_panel)
-        self.entry_doc.insert(0, self.doc_fiscal)
-        self.entry_doc.pack(fill=tk.X, pady=(0, 20))
+        tk.Label(right_panel, text="Histórico de Transações (Todas)", font=("Segoe UI", 12, "bold"), bg="white").pack(anchor="w")
 
-        tk.Label(left_panel, text="Operações:", bg="white", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        
-        self.btn_credito = tk.Button(left_panel, text="CRÉDITO", bg="#3498db", fg="white", font=("Segoe UI", 10, "bold"),
-                                     command=lambda: self.iniciar_transacao("CREDITO"))
-        self.btn_credito.pack(fill=tk.X, pady=5, ipady=5)
-
-        self.btn_debito = tk.Button(left_panel, text="DÉBITO", bg="#3498db", fg="white", font=("Segoe UI", 10, "bold"),
-                                    command=lambda: self.iniciar_transacao("DEBITO"))
-        self.btn_debito.pack(fill=tk.X, pady=5, ipady=5)
-
-        tk.Button(left_panel, text="ADMINISTRATIVO (ADM)", bg="#95a5a6", fg="white",
-                  command=lambda: self.iniciar_transacao("ADM")).pack(fill=tk.X, pady=20)
-        
-        self.lbl_status = tk.Label(left_panel, text="Aguardando...", bg="white", fg="gray")
-        self.lbl_status.pack(side=tk.BOTTOM)
-
-        # === PAINEL DIREITO (Lista de Pendências e Decisão) ===
-        
-        tk.Label(right_panel, text="Transações Aprovadas (Aguardando Decisão)", font=("Segoe UI", 12, "bold"), bg="#f0f2f5").pack(anchor="w")
-        
-        # Treeview
-        columns = ("nsu", "rede", "valor", "modalidade")
-        self.tree = ttk.Treeview(right_panel, columns=columns, show="headings", height=10)
-        self.tree.heading("nsu", text="NSU")
+        cols = ("rede", "nsu", "valor", "tipo", "status", "data")
+        self.tree = ttk.Treeview(right_panel, columns=cols, show="headings", height=15)
         self.tree.heading("rede", text="Rede")
+        self.tree.heading("nsu", text="NSU")
         self.tree.heading("valor", text="Valor")
-        self.tree.heading("modalidade", text="Modo")
+        self.tree.heading("tipo", text="Tipo")
+        self.tree.heading("status", text="Status")
+        self.tree.heading("data", text="Data")
         
+        self.tree.column("rede", width=80)
         self.tree.column("nsu", width=80)
-        self.tree.column("rede", width=100)
         self.tree.column("valor", width=80)
-        self.tree.column("modalidade", width=100)
+        self.tree.column("tipo", width=100) # Aumentei um pouco para caber "CRED PARC"
+        self.tree.column("status", width=100)
+        self.tree.column("data", width=80)
+        
         self.tree.pack(fill=tk.BOTH, expand=True, pady=10)
-
-        # Painel de Saldos
-        frame_totais = tk.Frame(right_panel, bg="#dfe6e9", padx=10, pady=10)
-        frame_totais.pack(fill=tk.X)
         
-        self.lbl_restante = tk.Label(frame_totais, text="Restante a Pagar: R$ 0,00", font=("Segoe UI", 12, "bold"), bg="#dfe6e9", fg="#c0392b")
-        self.lbl_restante.pack(side=tk.RIGHT)
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="Copiar NSU", command=self.copiar_nsu)
+        self.context_menu.add_command(label="Copiar Valor", command=self.copiar_valor)
+        self.context_menu.add_command(label="Cancelar Este Item", command=self.cancelar_inteligente)
+        self.tree.bind("<Button-3>", self.mostrar_menu_contexto)
 
-        # Botões de Decisão (O requisito principal)
-        frame_actions = tk.Frame(right_panel, bg="#f0f2f5", pady=20)
-        frame_actions.pack(fill=tk.X)
-
-        self.btn_confirmar = tk.Button(frame_actions, text="CONFIRMAR TRANSAÇÃO(ÕES)", bg="#27ae60", fg="white", font=("Segoe UI", 11, "bold"),
-                                       state=tk.DISABLED, command=self.acao_confirmar_tudo)
-        self.btn_confirmar.pack(side=tk.RIGHT, padx=5)
-
-        self.btn_desfazer = tk.Button(frame_actions, text="DESFAZER / ESTORNAR", bg="#e74c3c", fg="white", font=("Segoe UI", 11, "bold"),
-                                      state=tk.DISABLED, command=self.acao_desfazer_tudo)
-        self.btn_desfazer.pack(side=tk.RIGHT, padx=5)
+        footer = tk.Frame(right_panel, bg="white")
+        footer.pack(fill=tk.X)
         
-        self.btn_ignorar = tk.Button(frame_actions, text="Limpar Tela (Ignorar)", bg="#7f8c8d", fg="white",
-                                     state=tk.DISABLED, command=self.acao_ignorar)
-        self.btn_ignorar.pack(side=tk.LEFT, padx=5)
+        self.lbl_restante = tk.Label(footer, text="RESTANTE: R$ 0,00", font=("Segoe UI", 14, "bold"), bg="white", fg="#c0392b")
+        self.lbl_restante.pack(side=tk.TOP, pady=10)
+
+        tk.Button(footer, text="CONFIRMAR PENDENTES (F5)", bg="#2ecc71", fg="white", font=("Segoe UI", 10, "bold"), command=lambda: self.finalizar_pendentes(True)).pack(side=tk.RIGHT, padx=5)
+        tk.Button(footer, text="ESTORNAR PENDENTES", bg="#e74c3c", fg="white", font=("Segoe UI", 10, "bold"), command=lambda: self.finalizar_pendentes(False)).pack(side=tk.RIGHT, padx=5)
+        tk.Button(footer, text="Nova Venda (Limpar)", command=self.nova_venda).pack(side=tk.LEFT)
+
+        self.atualizar_interface()
 
     # =========================================================================
-    # LÓGICA DE TRANSAÇÃO
+    # LÓGICA DE DADOS & UTILS
     # =========================================================================
-    
-    def atualizar_saldos(self):
-        try:
-            total = float(self.entry_valor.get())
-        except:
-            total = 0.0
-            
-        pago = sum(t['valor_float'] for t in self.transacoes_pendentes)
-        restante = total - pago
+    def get_valor(self, entry):
+        try: return float(entry.get().replace(",", "."))
+        except: return 0.0
+
+    def atualizar_interface(self):
+        total = self.get_valor(self.entry_total)
+        pagos = [t['valor_float'] for t in self.historico_transacoes if t['status'] in ["PENDENTE", "CONFIRMADO"]]
+        pago_total = sum(pagos)
+        restante = round(max(0, total - pago_total), 2)
         
         self.valor_restante = restante
-        self.lbl_restante.config(text=f"Restante a Pagar: R$ {restante:.2f}")
+        self.lbl_restante.config(text=f"RESTANTE: R$ {restante:.2f}", fg="#c0392b" if restante > 0 else "#27ae60")
         
-        # Controle de Estado dos Botões
-        if len(self.transacoes_pendentes) > 0:
-            self.btn_confirmar.config(state=tk.NORMAL)
-            self.btn_desfazer.config(state=tk.NORMAL)
-            self.btn_ignorar.config(state=tk.NORMAL)
-            
-            # Trava inputs se já pagou tudo ou está em processo parcial
-            # (Opcional, mas boa prática para evitar mudança de valor total no meio)
-            self.entry_valor.config(state=tk.DISABLED)
+        if restante > 0:
+            self.entry_pagamento.delete(0, tk.END)
+            self.entry_pagamento.insert(0, f"{restante:.2f}")
         else:
-            self.btn_confirmar.config(state=tk.DISABLED)
-            self.btn_desfazer.config(state=tk.DISABLED)
-            self.btn_ignorar.config(state=tk.DISABLED)
-            self.entry_valor.config(state=tk.NORMAL)
+            self.entry_pagamento.delete(0, tk.END)
+            self.entry_pagamento.insert(0, "0.00")
 
-    def iniciar_transacao(self, tipo):
+    def mostrar_menu_contexto(self, event):
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.context_menu.post(event.x_root, event.y_root)
+
+    def copiar_nsu(self):
+        sel = self.tree.selection()
+        if not sel: return
+        item = self.tree.item(sel[0])
+        self.root.clipboard_clear()
+        self.root.clipboard_append(item['values'][1])
+
+    def copiar_valor(self):
+        sel = self.tree.selection()
+        if not sel: return
+        item = self.tree.item(sel[0])
+        self.root.clipboard_clear()
+        self.root.clipboard_append(item['values'][2])
+
+    def atualizar_treeview(self):
+        for i in self.tree.get_children(): self.tree.delete(i)
+        for t in self.historico_transacoes:
+            tipo_display = t['tipo']
+            if tipo_display == "CREDITO_PARCELADO":
+                tipo_display = f"CRED PARC ({t.get('parcelas', '?')}x)"
+            
+            self.tree.insert("", "end", values=(
+                t['rede'], t['nsu'], f"{t['valor_float']:.2f}", tipo_display, t['status'], t.get('data_operacao', '-')
+            ))
+
+    # =========================================================================
+    # CANCELAMENTO INTELIGENTE
+    # =========================================================================
+    def cancelar_inteligente(self):
+        sel = self.tree.selection()
+        
+        if sel:
+            idx_tree = self.tree.index(sel[0])
+            if idx_tree < len(self.historico_transacoes):
+                transacao = self.historico_transacoes[idx_tree]
+                
+                if messagebox.askyesno("Cancelar", f"Cancelar transação?\n\nNSU: {transacao['nsu']}\nValor: {transacao['valor_float']}"):
+                    val_cents = str(int(round(transacao['valor_float'] * 100)))
+                    
+                    hora_padrao = datetime.now().strftime("%H%M%S")
+                    
+                    dados_extras = {
+                        'nsu': transacao['nsu'],
+                        'data': transacao.get('data_operacao', datetime.now().strftime("%d%m%Y")),
+                        'hora': transacao.get('hora_operacao', hora_padrao),
+                        'rede': transacao['rede']
+                    }
+
+                    if "PIX" in transacao['tipo']:
+                        threading.Thread(target=self.thread_tef, args=("DEVOLUCAO_PIX", val_cents, dados_extras)).start()
+                    else:
+                        threading.Thread(target=self.thread_tef, args=("CNC", val_cents, dados_extras)).start()
+            return
+        
+        self.popup_cancelamento_cnc_manual()
+
+    def popup_cancelamento_cnc_manual(self):
+        fields = [
+            ("NSU Original:", "nsu"),
+            ("Data Original (DDMMAAAA):", "data"),
+            ("Hora Original (HHMMSS):", "hora"),
+            ("Valor a Cancelar (Ex: 10.00):", "valor")
+        ]
+        dialog = InputDialog(self.root, "Cancelamento Manual (Cartão)", fields)
+        self.root.wait_window(dialog)
+        
+        if dialog.result:
+            try:
+                val_cents = str(int(round(float(dialog.result['valor'].replace(",", ".")) * 100)))
+                dialog.result['rede'] = "" 
+                threading.Thread(target=self.thread_tef, args=("CNC", val_cents, dialog.result)).start()
+            except ValueError:
+                messagebox.showerror("Erro", "Valor inválido")
+
+    # =========================================================================
+    # TEF CORE
+    # =========================================================================
+    def iniciar_tef(self, tipo):
         if self.lock: return
         
-        # Se for ADM, vai direto
-        if tipo == "ADM":
-            threading.Thread(target=self.thread_tef, args=(tipo, 0)).start()
-            return
+        if tipo == "ADM_GENERICO":
+             threading.Thread(target=self.thread_tef, args=("ADM", 0, None)).start()
+             return
 
-        # Lógica de valor
-        try:
-            valor_total_ini = float(self.entry_valor.get())
-            if self.valor_restante <= 0 and len(self.transacoes_pendentes) == 0:
-                # Primeira transação
-                self.valor_restante = valor_total_ini
-            elif self.valor_restante <= 0:
-                messagebox.showinfo("Aviso", "Valor total já foi atingido. Confirme ou Desfaça.")
-                return
-        except ValueError:
-            messagebox.showerror("Erro", "Valor inválido.")
-            return
+        val_pagar = self.get_valor(self.entry_pagamento)
+        if val_pagar <= 0: return
 
-        # Pergunta valor parcial se for múltiplos cartões
-        valor_processar = self.valor_restante
-        
-        # Se quiser permitir dividir explicitamente agora:
-        if len(self.transacoes_pendentes) > 0 or messagebox.askyesno("Valor", f"Valor Restante: {self.valor_restante:.2f}\nDeseja passar o valor total restante?"):
-            pass
-        else:
-            v_str = simpledialog.askstring("Parcial", "Digite o valor para este cartão:")
-            if v_str:
-                try: valor_processar = float(v_str.replace(',', '.'))
-                except: return
-            else:
+        if "PIX" in tipo or "CREDITO" in tipo or "DEBITO" in tipo:
+            if val_pagar > self.valor_restante + 0.01 and any(t['status'] == "PENDENTE" for t in self.historico_transacoes):
+                messagebox.showerror("Erro", "Valor excede o restante.")
                 return
 
-        if valor_processar > self.valor_restante + 0.01: # Tolerância float
-            messagebox.showerror("Erro", "Valor maior que o restante.")
-            return
+        val_cents = str(int(round(val_pagar * 100)))
+        dados_extras = None
 
-        # Converter para centavos (string sem ponto) [cite: 250]
-        valor_cents = str(int(round(valor_processar * 100)))
-        
-        threading.Thread(target=self.thread_tef, args=(tipo, valor_cents)).start()
+        # TRATAMENTO PARA PARCELADO
+        if tipo == "CREDITO_PARCELADO":
+            parcelas = simpledialog.askinteger("Parcelamento", "Quantidade de Parcelas (2 a 99):", minvalue=2, maxvalue=99)
+            if not parcelas: return
+            dados_extras = {'parcelas': parcelas}
 
-    def thread_tef(self, tipo, valor_cents):
+        threading.Thread(target=self.thread_tef, args=(tipo, val_cents, dados_extras)).start()
+
+    def thread_tef(self, tipo, valor_cents, dados_extras):
         self.lock = True
-        self.lbl_status.config(text="Processando TEF...", fg="blue")
+        self.lbl_status.config(text=f"Processando {tipo}...", fg="blue")
         
         try:
+            # Garante ID sequencial único para o log
             id_req = SequenceManager.get_next_id()
-            doc = self.entry_doc.get()
-            
-            # Monta Requisição
-            req = {
-                "001-000": id_req,
-                "002-000": doc,
-            }
-            
-            if tipo == "ADM":
-                req["000-000"] = "ADM" # [cite: 250]
-            else:
-                req["000-000"] = "CRT" # [cite: 250]
-                req["003-000"] = valor_cents
-                # 10=Crédito, 20=Débito [cite: 260]
-                req["011-000"] = "10" if tipo == "CREDITO" else "20" 
-                
-                # Flag Múltiplos Cartões 
-                # Se já tem pendente ou se o valor é parcial, indicamos Múltiplos
-                if len(self.transacoes_pendentes) > 0 or float(valor_cents)/100 < self.valor_restante:
-                     req["099-000"] = "1"
+            req = {"001-000": id_req}
 
-            # Envia
-            if not TefFileHandler.write_request(req):
-                raise Exception("Falha ao criar arquivo de requisição.")
+            if tipo == "ADM":
+                req["000-000"] = "ADM"
             
-            # Aguarda
-            resp, status_msg = TefFileHandler.wait_response()
-            
-            if not resp:
-                raise Exception(status_msg)
-            
-            # Processa Resposta
-            cod_resp = resp.get("009-000") # 0 = Aprovada [cite: 250]
-            msg_op = resp.get("030-000", "") # Mensagem Operador 
-            
-            if cod_resp == "0":
-                if tipo == "ADM":
-                    messagebox.showinfo("ADM", f"Operação realizada:\n{msg_op}")
+            elif tipo == "DEVOLUCAO_PIX":
+                req["000-000"] = "ADM"
+                req["003-000"] = valor_cents
+                req["012-000"] = dados_extras['nsu']
+                req["719-000"] = dados_extras['data']
+                
+            elif tipo == "CNC":
+                req["000-000"] = "CNC"
+                req["002-000"] = self.doc_fiscal
+                req["003-000"] = valor_cents
+                req["012-000"] = dados_extras['nsu']
+                req["022-000"] = dados_extras['data']
+                if dados_extras.get('hora'):
+                     req["023-000"] = dados_extras['hora']
+                if dados_extras.get('rede'):
+                     req["010-000"] = dados_extras['rede']
+
+            elif tipo == "PIX_PAGAMENTO":
+                req["000-000"] = "QRC"
+                req["002-000"] = self.doc_fiscal
+                req["003-000"] = valor_cents
+                
+            else: # CREDITO / DEBITO / PARCELADO
+                req["000-000"] = "CRT"
+                req["002-000"] = self.doc_fiscal
+                req["003-000"] = valor_cents
+                
+                if tipo == "CREDITO":
+                    req["011-000"] = "10"
+                elif tipo == "DEBITO":
+                    req["011-000"] = "20"
+                elif tipo == "CREDITO_PARCELADO":
+                    # 11 = Parcelado Loja (Sem Juros)
+                    req["011-000"] = "11" 
+                    # 018-000 = Quantidade de parcelas (formato 02, 03...)
+                    if dados_extras and 'parcelas' in dados_extras:
+                        req["018-000"] = str(dados_extras['parcelas']).zfill(2)
+
+            # Flag Múltiplos
+            pendentes = [t for t in self.historico_transacoes if t['status'] == "PENDENTE"]
+            if tipo in ["CRT", "PIX_PAGAMENTO", "CREDITO", "DEBITO", "CREDITO_PARCELADO"] and (float(valor_cents)/100 < self.valor_restante or pendentes):
+                req["099-000"] = "1"
+
+            if not TefFileHandler.write_request(req): raise Exception("Erro ao gravar arquivo.")
+            resp, status = TefFileHandler.wait_response()
+            if not resp: raise Exception(status)
+
+            cod = resp.get("009-000")
+            msg = resp.get("030-000", "")
+
+            if cod == "0":
+                if tipo == "DEVOLUCAO_PIX":
+                    messagebox.showinfo("Sucesso", f"PIX Devolvido!\n{msg}")
+                    if dados_extras and dados_extras.get('nsu'):
+                        for t in self.historico_transacoes:
+                            if t['nsu'] == dados_extras['nsu']:
+                                t['status'] = "DEVOLVIDO (PIX)"
+                        self.root.after(0, self.atualizar_treeview)
+                
+                elif tipo == "CNC":
+                    if messagebox.askyesno("Confirmar Estorno", f"Estorno Aprovado.\n{msg}\nConfirmar operação?"):
+                        self.enviar_confirmacao_imediata(id_req, resp)
+                        if dados_extras and dados_extras.get('nsu'):
+                            for t in self.historico_transacoes:
+                                if t['nsu'] == dados_extras['nsu']:
+                                    t['status'] = "CANCELADO"
+                        self.root.after(0, self.atualizar_treeview)
+
+                elif tipo == "ADM":
+                    messagebox.showinfo("ADM", f"{msg}")
+
                 else:
-                    # SUCESSO NA TRANSAÇÃO DE PAGAMENTO
-                    # Armazena dados críticos para CNF/NCN
-                    dados_aprovados = {
-                        "nsu": resp.get("012-000"), # [cite: 265]
-                        "rede": resp.get("010-000"), # [cite: 260]
-                        "finalizacao": resp.get("027-000"), # CRÍTICO 
-                        "id_original": id_req,
+                    data_op = resp.get("022-000") or resp.get("015-000")
+                    hora_op = resp.get("023-000") or resp.get("016-000")
+
+                    if data_op and len(data_op) > 8: data_op = data_op[:8] 
+                    if hora_op and len(hora_op) > 6: hora_op = hora_op[:6]
+
+                    dados = {
+                        "id_req": id_req,
+                        "nsu": resp.get("012-000"),
+                        "rede": resp.get("010-000"),
+                        "finalizacao": resp.get("027-000"),
                         "valor_float": float(valor_cents)/100,
-                        "modo": tipo,
-                        "doc": doc
+                        "tipo": tipo,
+                        "parcelas": dados_extras['parcelas'] if dados_extras and 'parcelas' in dados_extras else "",
+                        "data_operacao": data_op if data_op else datetime.now().strftime("%d%m%Y"),
+                        "hora_operacao": hora_op if hora_op else datetime.now().strftime("%H%M%S"),
+                        "status": "PENDENTE"
                     }
-                    
-                    # Atualiza UI na thread principal
-                    self.root.after(0, lambda: self.adicionar_pendencia(dados_aprovados))
-                    
+                    self.historico_transacoes.append(dados)
+                    self.root.after(0, self.atualizar_treeview)
+                    self.root.after(0, self.atualizar_interface)
             else:
-                messagebox.showwarning("Negada", f"Erro TEF: {msg_op}")
+                messagebox.showwarning("Recusado", f"Erro TEF: {msg}")
 
         except Exception as e:
             messagebox.showerror("Erro", str(e))
         finally:
             self.lock = False
-            self.lbl_status.config(text="Caixa Livre", fg="gray")
+            self.root.after(0, lambda: self.lbl_status.config(text="Livre", fg="gray"))
 
-    def adicionar_pendencia(self, dados):
-        self.transacoes_pendentes.append(dados)
-        self.tree.insert("", "end", values=(dados['nsu'], dados['rede'], f"{dados['valor_float']:.2f}", dados['modo']))
-        self.atualizar_saldos()
+    def enviar_confirmacao_imediata(self, id_original, resp_dados):
+        id_cnf = SequenceManager.get_next_id()
+        req = {
+            "000-000": "CNF",
+            "001-000": id_cnf,
+            "002-000": self.doc_fiscal,
+            "010-000": resp_dados.get("010-000"),
+            "012-000": resp_dados.get("012-000"),
+            "027-000": resp_dados.get("027-000")
+        }
+        TefFileHandler.write_request(req)
 
-    # =========================================================================
-    # AÇÕES DE DECISÃO (CONFIRMAR, DESFAZER, IGNORAR)
-    # =========================================================================
-
-    def enviar_confirmacao_final(self, confirmar=True):
-        """
-        Envia CNF ou NCN para TODAS as transações pendentes.
-        Obrigatório enviar o campo 099-000=1 se houver múltiplos cartões envolvidos[cite: 140, 154].
-        """
-        if not self.transacoes_pendentes: return
-
-        comando = "CNF" if confirmar else "NCN" # [cite: 178]
-        acao_txt = "Confirmando" if confirmar else "Desfazendo"
+    def finalizar_pendentes(self, confirmar):
+        pendentes = [t for t in self.historico_transacoes if t['status'] == "PENDENTE"]
+        if not pendentes: return
         
-        self.lbl_status.config(text=f"{acao_txt} lote...", fg="orange")
-        
-        # Cópia da lista para iterar
-        pendentes = list(self.transacoes_pendentes)
-        
-        def processar():
-            erros = []
-            for trx in pendentes:
+        acao = "CONFIRMAR" if confirmar else "ESTORNAR"
+        if not messagebox.askyesno("Finalizar", f"Deseja {acao} {len(pendentes)} transações?"): return
+
+        def process_batch():
+            self.lock = True
+            cmd = "CNF" if confirmar else "NCN"
+            novo_status = "CONFIRMADO" if confirmar else "ESTORNADO"
+            
+            for item in pendentes:
+                # Cada CNF ganha um ID SEQUENCIAL ÚNICO
                 id_cnf = SequenceManager.get_next_id()
                 req = {
-                    "000-000": comando,
+                    "000-000": cmd,
                     "001-000": id_cnf,
-                    "002-000": trx['doc'],
-                    "010-000": trx['rede'],     # Obrigatório [cite: 117]
-                    "012-000": trx['nsu'],      # Obrigatório [cite: 117]
-                    "027-000": trx.get('finalizacao', '') # Obrigatório devolver 
+                    "002-000": self.doc_fiscal,
+                    "010-000": item['rede'],
+                    "012-000": item['nsu'],
+                    "027-000": item['finalizacao'],
+                    "099-000": "1"
                 }
-                
-                # Se há mais de uma transação ou foi marcado como múltiplo, a confirmação deve ter a flag
-                # Nota: Auttar recomenda sempre enviar 099=1 se o fluxo original foi de múltiplos [cite: 287, 456]
-                req["099-000"] = "1"
-
                 TefFileHandler.write_request(req)
-                # O comando CNF/NCN geralmente não gera resposta visual (IntPos.001) por padrão,
-                # a menos que configurado HABILITA_RESP_TODAS_OPE=1[cite: 235].
-                # Assumimos fire-and-forget com pequeno delay.
-                time.sleep(1.5)
+                item['status'] = novo_status
+                time.sleep(1.0) 
+
+            self.root.after(0, self.atualizar_treeview)
+            self.root.after(0, self.atualizar_interface)
             
-            # Limpa UI
-            self.root.after(0, self.limpar_tudo)
-            msg = "Venda Finalizada com Sucesso!" if confirmar else "Venda Cancelada/Estornada."
+            msg = "Finalizado com Sucesso!" if confirmar else "Estornos Solicitados."
             self.root.after(0, lambda: messagebox.showinfo("Fim", msg))
+            self.lock = False
 
-        threading.Thread(target=processar).start()
+        threading.Thread(target=process_batch).start()
 
-    def acao_confirmar_tudo(self):
-        if not self.transacoes_pendentes: return
-        if self.valor_restante > 0.01:
-            if not messagebox.askyesno("Aviso", f"Ainda falta R$ {self.valor_restante:.2f}. Deseja finalizar (CNF) o que já foi aprovado?"):
-                return
-        
-        if messagebox.askyesno("Confirmar", "Deseja CONFIRMAR EFETIVAMENTE todas as transações listadas?"):
-            self.enviar_confirmacao_final(confirmar=True)
-
-    def acao_desfazer_tudo(self):
-        if not self.transacoes_pendentes: return
-        if messagebox.askyesno("Desfazer", "Deseja ESTORNAR (NCN) todas as transações listadas?"):
-            self.enviar_confirmacao_final(confirmar=False)
-
-    def acao_ignorar(self):
-        """Limpa a tela sem enviar nada ao TEF (Perigoso, mas solicitado)"""
-        if messagebox.askyesno("Cuidado", "Isso removerá as transações da tela SEM enviar Confirmação ou Desfazimento.\n\nAs transações podem ficar pendentes no servidor TEF.\n\nContinuar?"):
-            self.limpar_tudo()
-
-    def limpar_tudo(self):
-        self.transacoes_pendentes = []
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-        self.atualizar_saldos()
-        # Novo Doc Fiscal simulado
-        try:
-            novo_doc = int(self.entry_doc.get()) + 1
-            self.entry_doc.delete(0, tk.END)
-            self.entry_doc.insert(0, str(novo_doc))
-        except: pass
-        self.lbl_status.config(text="Pronto", fg="gray")
+    def nova_venda(self):
+        self.historico_transacoes = []
+        self.doc_fiscal = str(int(self.doc_fiscal) + 1)
+        self.entry_total.config(state=tk.NORMAL)
+        self.entry_total.delete(0, tk.END)
+        self.entry_total.insert(0, "100.00")
+        self.atualizar_treeview()
+        self.atualizar_interface()
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = MainApp(root)
+    app = ModernPDV(root)
     root.mainloop()
